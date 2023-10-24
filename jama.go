@@ -9,7 +9,6 @@ import (
 	"os"
 	"runtime"
 	"sync"
-	"sync/atomic"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -23,77 +22,76 @@ import (
 
 // TODO: support for more platforms
 
-// TODO: parallel tests? we'll only follow the main process, not any other
-// os-level threads spawned by go. we'll have to follow all children but make
-// sure we don't accidentally follow exec'd actual other processes, then also
-// be able to determine the running goroutine's id by inspecting the child
-// through ptrace... not sure if this is doable.
-
 // jamaChildEnv is the name of the environment variable used to signal that
 // we're running in the child process which should be traced.
 const jamaChildEnv = "JAMA_CHILD"
 
-type Mutator interface {
-	Mutate(tid int, regs *unix.PtraceRegs)
-}
-
 var (
-	mutator   Mutator = nil
-	mutatorMu sync.Mutex
+	// m is the global mutator. Only used in the client process.
+	m mutator = nil
+	// mu protects m.
+	mu sync.Mutex
 )
 
-// GlobalMutator applies the same thread mutation to all
-type GlobalMutator func(regs *unix.PtraceRegs)
+// TODO: Do I panic, or just lock?
 
-// Mutate implements Mutator.
-func (m GlobalMutator) Mutate(tid int, regs *unix.PtraceRegs) { m(regs) }
-
-var _ Mutator = GlobalMutator(nil)
-
-// PerTIDMutator mutates registers on a per-TID basis.
-type PerTIDMutator map[int]func(regs *unix.PtraceRegs)
-
-// Mutate implements Mutator.
-func (m PerTIDMutator) Mutate(tid int, regs *unix.PtraceRegs) {
-	mf, ok := m[tid]
-	if !ok {
-		return
+// WithGlobal calls f with mf active for all goroutines. It cannot be used
+// concurrently with any other With* calls, including other calls of itself.
+func WithGlobal(mf MutatorFunc, f func()) {
+	mu.Lock()
+	if m != nil {
+		mu.Unlock()
+		panic("jama: WithGlobal: called while other mutation was already active")
 	}
-
-	mf(regs)
-}
-
-var _ Mutator = PerTIDMutator{}
-
-func WithGlobal(mf func(regs *unix.PtraceRegs), f func()) {
-	mutatorMu.Lock()
-
-	if mutator != nil {
-		mutatorMu.Unlock()
-		panic("jama: WithGlobal: called when existing mutator was already active")
-	}
-
-	mutator = GlobalMutator(mf)
-	mutatorMu.Unlock()
+	m = globalMutator(mf)
+	mu.Unlock()
 
 	f()
 
-	mutatorMu.Lock()
-	mutator = nil
-	mutatorMu.Unlock()
+	mu.Lock()
+	m = nil
+	mu.Unlock()
 }
 
-func WithLocal(mf func(regs *unix.PtraceRegs), f func()) {
-	mutatorMu.Lock()
-
-	if mutator == nil {
-		mutator = PerTIDMutator{}
-	}
-
+// WithLocal calls f with mf active for the current goroutine. If f creates new
+// goroutines, mf will not apply to them. It cannot be used concurrently with
+// any other With* calls, and cannot be nested within calls to itself (i.e. f
+// cannot call WithLocal).
+func WithLocal(mf MutatorFunc, f func()) {
+	// Necessary so the goroutine that f is executed on is guaranteed to match
+	// the tid below.
 	runtime.LockOSThread()
-	something[unix.Gettid()] = m
+	defer runtime.UnlockOSThread()
+
+	tid := unix.Gettid()
+
+	mu.Lock()
+
+	var perTID perTIDMutator
+	var ok bool
+	if m == nil {
+		// If there was no active mutator, create a new per-TID mutator.
+		perTID = perTIDMutator{}
+		m = perTID
+	} else if perTID, ok = m.(perTIDMutator); !ok {
+		// If there was an active mutator but it wasn't per-TID, panic.
+		mu.Unlock()
+		panic("jama: WithLocal: called while global mutation was already active")
+	}
+
+	if _, ok := perTID[tid]; ok {
+		mu.Unlock()
+		panic("jama: WithLocal: called while mutation for this goroutine was already active")
+	}
+
+	perTID[tid] = mf
+	mu.Unlock()
+
 	f()
-	runtime.UnlockOSThread()
+
+	mu.Lock()
+	delete(perTID, tid)
+	mu.Unlock()
 }
 
 func init() {
