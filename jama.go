@@ -5,11 +5,11 @@ package jama
 import (
 	"encoding/gob"
 	"fmt"
-	"math"
 	"os"
 	"runtime"
 	"sync"
 	"syscall"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -91,7 +91,25 @@ func WithLocal(mf MutatorFunc, f func()) {
 
 	mu.Lock()
 	delete(perTID, tid)
+	if len(perTID) == 0 {
+		m = nil
+	}
 	mu.Unlock()
+}
+
+// isPtraceStop returns whether status indicates that the process/thread was
+// stopped by ptrace.
+func isPtraceStop(status unix.WaitStatus) bool {
+	// The |0x80 specifically indicates that this change was triggered by
+	// ptrace, as requested by out use of the PTRACE_O_TRACESYSGOOD option.
+	return status.Stopped() && status.StopSignal() == unix.SIGTRAP|0x80
+}
+
+// isEventClone returns whether status indicates that the process/thread was
+// stopped due to a pthread clone event.
+func isEventClone(status unix.WaitStatus) bool {
+	return status.Stopped() &&
+		status>>8 == unix.WaitStatus(unix.SIGTRAP|unix.PTRACE_EVENT_CLONE<<8)
 }
 
 func init() {
@@ -135,127 +153,112 @@ func init() {
 		os.Exit(1)
 	}
 	pid := proc.Pid
-	fmt.Println(pid)
 
 	// Wait for the child to stop itself when it reaches the branch above.
 	var status unix.WaitStatus
-	if _, err := unix.Wait4(pid, &status, unix.WSTOPPED, nil); err != nil {
+	if _, err := unix.Wait4(pid, &status, 0, nil); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
-	fmt.Println(status.Stopped())
-	fmt.Println(status.StopSignal())
-	// We need traceclone so we can monitor all goroutines
-	if err := unix.PtraceSetOptions(pid, unix.PTRACE_O_TRACECLONE); err != nil {
+	// We need traceclone so we can monitor all goroutines.
+	options := unix.PTRACE_O_TRACECLONE | unix.PTRACE_O_TRACESYSGOOD
+	if err := unix.PtraceSetOptions(pid, options); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	// fmt.Println("here2")
 
-	// Keep track of whether we're entering or exiting a syscall.
-	var isExit = true
+	lastTid := pid
 	for {
-		// fmt.Println("here3")
-		// entries, err := os.ReadDir(fmt.Sprintf("/proc/%d/task", pid))
-		// if err != nil {
-		// 	fmt.Fprintln(os.Stderr, err)
-		// 	os.Exit(1)
-		// }
-		// for _, entry := range entries {
-		// 	// fmt.Println(entry.Name())
-		// }
-
 		// Allow the child to continue until the next syscall entry or exit, at
 		// which point it will be stopped.
-		if err := unix.PtraceSyscall(pid, 0); err != nil {
+		if err := unix.PtraceSyscall(lastTid, 0); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
 
-		// fmt.Println("here4")
-
-		// Wait until the process changes state.
+		// Wait until we get a relevant state change.
 		var status unix.WaitStatus
-		pid_, err := unix.Wait4(pid, &status, 0, nil)
-		if err != nil {
+		for {
+			var err error
+			lastTid, err = unix.Wait4(-1, &status, unix.WUNTRACED, nil)
+			if err != nil {
+				if err == unix.EINTR {
+					continue
+				}
+
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+
+			if isPtraceStop(status) || isEventClone(status) {
+				break
+			}
+
+			// If the whole child (not just one of its threads) exited, then we
+			// should exit too because there's nothing left to do.
+			if lastTid == pid {
+				switch {
+				case status.Exited():
+					os.Exit(status.ExitStatus())
+
+				case status.Signaled():
+					// Format copied from (*os.ProcessState).String.
+					msg := "signal: " + status.Signal().String()
+					if status.CoreDump() {
+						msg += " (core dumped)"
+					}
+
+					fmt.Fprintln(os.Stderr, msg)
+					os.Exit(1)
+				}
+			}
+		}
+
+		if isEventClone(status) {
+			// Find out the name of the new thread and resume it.
+			newTid, err := unix.PtraceGetEventMsg(lastTid)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+
+			if err := unix.PtraceSyscall(int(newTid), 0); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+
+			continue
+		}
+
+		// PTRACE_GET_SYSCALL_INFO actually returns a big struct, but op is the
+		// first field, and the data is truncated if there's not space for it,
+		// so since we only need op, we do this to avoid having to get
+		// definitions for the whole struct.
+		var op uint8
+		_, _, err := unix.Syscall6(unix.SYS_PTRACE,
+			unix.PTRACE_GET_SYSCALL_INFO, uintptr(lastTid), unsafe.Sizeof(op),
+			uintptr(unsafe.Pointer(&op)), 0, 0)
+		if err != 0 {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-		fmt.Println("here5", pid_)
-		if int(status)>>8 == (int(unix.SIGTRAP) | (unix.PTRACE_EVENT_CLONE << 8)) {
-			// fmt.Println("gottem")
-			msg, err := unix.PtraceGetEventMsg(pid)
-			if err != nil {
-				panic(err)
-			}
-			fmt.Println("message was:", msg)
-		}
-		switch {
-		case status.Stopped():
-			switch {
-			case status.StopSignal() == unix.SIGTRAP:
-
-			default:
-				// TODO: this happens sometimes, ignore?
-				// Also, look at TRACESYSGOOD?
-				fmt.Fprintf(os.Stderr, "jama: child was stopped with unexpected signal 0x%x, an outside process may be interfering", int(status.StopSignal()))
-				isExit = !isExit
-				// panic(fmt.Sprintf("jama: child was stopped with unexpected signal 0x%x, an outside process may be interfering", int(status.StopSignal())))
-			}
-
-			// Continue to inspection below.
-
-		case status.Exited():
-			os.Exit(status.ExitStatus())
-
-		case status.Signaled():
-			// Format copied from (*os.ProcessState).String.
-			msg := "signal: " + status.Signal().String()
-			if status.CoreDump() {
-				msg += " (core dumped)"
-			}
-			fmt.Fprintln(os.Stderr, msg)
-			os.Exit(1)
-
-		case status.Continued():
-			// This should never happen. If it does, that means someone else is
-			// interfering with the child, and we're not going to be able to
-			// handle that correctly, so just fail noisily.
-			panic("jama: child was unexpectedly continued, an outside process may be interfering")
-
-		default:
-			panic(fmt.Sprintf("jama: unhandled process state: %x", status))
-		}
-
-		// If the prior inspection was the exit of a syscall, then next time the
-		// process stops will be the entry to a syscall, and vice versa.
-		isExit = !isExit
-		if !isExit {
+		if op != unix.PTRACE_SYSCALL_INFO_EXIT {
+			// We only act on syscall exits.
 			continue
 		}
 
 		var regs unix.PtraceRegs
-		if err := unix.PtraceGetRegs(pid, &regs); err != nil {
+		if err := unix.PtraceGetRegs(lastTid, &regs); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
 
-		if regs.Orig_rax == unix.SYS_NEWFSTATAT {
-			// TODO: Provide a nice API for controlling what to complain
-			// about. Ideally we should provide something that can just
-			// mutate all of regs for people that want to do custom stuff,
-			// but then provide convenience functions built on that that do
-			// things like fail for specific syscalls. The best way to do
-			// this from a control-flow perspective would probably be to
-			// have a jama.WithStatFail(f func()) sort of thing. The biggest
-			// probably if we want a really flexible API is how to allow
-			// that if the child is stopped during the syscall handling. We
-			// could make them define things up front in the Init maybe but
-			// that wouldn't be the most ergonomic.
+		// TODO: mutate regs over rpc
+		mregs := regs
 
-			regs.Rax = uint64((unix.ENOENT ^ math.MaxUint64) + 1)
-			if err := unix.PtraceSetRegs(pid, &regs); err != nil {
+		if regs != mregs {
+			if err := unix.PtraceSetRegs(lastTid, &mregs); err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}

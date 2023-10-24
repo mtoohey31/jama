@@ -1,14 +1,11 @@
 package jamatest
 
 import (
-	"fmt"
 	"os"
-	"runtime"
 	"sync"
 	"testing"
 
 	"mtoohey.com/jama"
-	_ "mtoohey.com/jama"
 )
 
 // func TestMain(m *testing.M) {
@@ -25,12 +22,8 @@ import (
 // }
 
 func TestFoo(t *testing.T) {
-	_ = runtime.GOOS
-	runtime.LockOSThread()
-
 	var wg sync.WaitGroup
 	wg.Add(1)
-	fmt.Println("here9")
 	go func() {
 		defer wg.Done()
 		_, err := os.Stat("file")
@@ -42,7 +35,7 @@ func TestFoo(t *testing.T) {
 }
 
 func TestBar(t *testing.T) {
-	jama.WithStatFailing(func() {
+	jama.WithLocal(nil, func() {
 		_, err := os.Stat("file")
 		if err != nil {
 			t.Fatal(err)
