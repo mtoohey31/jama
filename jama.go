@@ -4,15 +4,20 @@ package jama
 
 import (
 	"encoding/gob"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
+
+// TODO: WTF is line 72 and onwards???
 
 // TODO: communication between parent and child and API for controlling what
 // fails/manipulating things arbitrarily.
@@ -102,7 +107,7 @@ func WithLocal(mf MutatorFunc, f func()) {
 func isPtraceStop(status unix.WaitStatus) bool {
 	// The |0x80 specifically indicates that this change was triggered by
 	// ptrace, as requested by out use of the PTRACE_O_TRACESYSGOOD option.
-	return status.Stopped() && status.StopSignal() == unix.SIGTRAP|0x80
+	return status.StopSignal() == unix.SIGTRAP|0x80
 }
 
 // isEventClone returns whether status indicates that the process/thread was
@@ -113,16 +118,89 @@ func isEventClone(status unix.WaitStatus) bool {
 }
 
 func init() {
-	gob.Register(unix.PtraceRegs{})
+	const (
+		CLIENTR_FD = iota + 3 // stdin, stdout, and stderr take up 1, 2, and 3.
+		CLIENTW_FD
+	)
+
+	// Protocol types.
+	type (
+		childMutatorTID int
+		ipcActive       struct{}
+		regsAndTID      struct {
+			Regs unix.PtraceRegs
+			TID  int
+		}
+	)
+
+	mutatorID := childMutatorTID(0)
+	gob.Register(&mutatorID)
+	gob.Register(&ipcActive{})
+	gob.Register(&regsAndTID{})
+	gob.Register(&unix.PtraceRegs{})
 
 	if _, found := os.LookupEnv(jamaChildEnv); found {
-		// // Stop self and wait for parent to take control via ptrace.
-		// if err := unix.Kill(unix.Getpid(), unix.SIGSTOP); err != nil {
-		// 	fmt.Fprintln(os.Stderr, err)
-		// 	os.Exit(1)
-		// }
+		introDone := make(chan struct{})
+		go func() {
+			// Lock this thread so we can stop tracing only it in the parent.
+			runtime.LockOSThread()
 
-		// TODO: start rpc?
+			dec := gob.NewDecoder(io.TeeReader(os.NewFile(CLIENTR_FD, "jama-read.pipe"), os.Stdout))
+			enc := gob.NewEncoder(os.NewFile(CLIENTW_FD, "jama-write.pipe"))
+
+			tid := unix.Gettid()
+			msg := childMutatorTID(tid)
+			fmt.Println("child is tid:", tid)
+			if err := enc.Encode(&msg); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+
+			fmt.Println("waiting for active")
+
+			var a ipcActive
+			if err := dec.Decode(&a); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+
+			// TODO: We've got a problem with proceeding. We can't exit init
+			// until we know that ipc and stuff is active, but that stuff can't
+			// be active until we know that this routine will be ready to accept
+			// stuff...
+
+			fmt.Println("marking intro done")
+			introDone <- struct{}{}
+			fmt.Println("done intro")
+
+			for {
+				fmt.Println("decoding child")
+
+				var asdf regsAndTID
+				if err := dec.Decode(&asdf); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					os.Exit(1)
+				}
+
+				fmt.Println("decoded child")
+
+				mu.Lock()
+				if m != nil {
+					m.mutate(asdf.TID, &asdf.Regs)
+				}
+				mu.Unlock()
+
+				fmt.Println("encoding child")
+
+				if err := enc.Encode(&asdf.Regs); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					os.Exit(1)
+				}
+
+				fmt.Println("encoded child")
+			}
+		}()
+		<-introDone
 
 		// Continue usual program execution with ptrace now active.
 		return
@@ -131,11 +209,27 @@ func init() {
 	// If not set, we're in the parent, so start a child that will take the
 	// branch above and become ptrace'd by us.
 
+	// Create files and pipes to be used by child.
 	devNull, err := os.Open(os.DevNull)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+
+	clientR, parentW, err := os.Pipe()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	parentR, clientW, err := os.Pipe()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	enc := gob.NewEncoder(parentW)
+	dec := gob.NewDecoder(parentR)
 
 	// Necessary because only the thread that spawns the process below which
 	// will call PTRACE_TRACEME on startup will have permission to contorol it,
@@ -144,9 +238,12 @@ func init() {
 	runtime.LockOSThread()
 
 	proc, err := os.StartProcess(os.Args[0], os.Args, &os.ProcAttr{
-		Files: []*os.File{devNull, os.Stdout, os.Stderr},
-		Env:   append(os.Environ(), jamaChildEnv+"=1"),
-		Sys:   &syscall.SysProcAttr{Ptrace: true},
+		Files: []*os.File{
+			devNull, os.Stdout, os.Stderr,
+			CLIENTR_FD: clientR, CLIENTW_FD: clientW,
+		},
+		Env: append(os.Environ(), jamaChildEnv+"=1"),
+		Sys: &syscall.SysProcAttr{Ptrace: true},
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -157,33 +254,71 @@ func init() {
 	// Wait for the child to stop itself when it reaches the branch above.
 	var status unix.WaitStatus
 	if _, err := unix.Wait4(pid, &status, 0, nil); err != nil {
+		// TODO: handle other potential status changes here so we're guaranteed
+		// to be ptrace-stopped when we get to below.
+
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
-	// We need traceclone so we can monitor all goroutines.
+	// We need PTRACE_O_TRACECLONE so we can monitor all goroutines and
+	// PTRACE_O_TRACESYSGOOD so we can precisely detect when a SIGTRAP was
+	// caused by ptrace.
 	options := unix.PTRACE_O_TRACECLONE | unix.PTRACE_O_TRACESYSGOOD
 	if err := unix.PtraceSetOptions(pid, options); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
-	lastTid := pid
-	for {
-		// Allow the child to continue until the next syscall entry or exit, at
-		// which point it will be stopped.
-		if err := unix.PtraceSyscall(lastTid, 0); err != nil {
+	var serverTID atomic.Int64
+	go func() {
+		var tid childMutatorTID
+		if err := dec.Decode(&tid); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+
+		// // Stop tracing the server thread of the child so it never gets stopped.
+		// if err := syscall.PtraceDetach(int(tid)); err != nil {
+		// 	fmt.Fprintln(os.Stderr, err)
+		// 	os.Exit(1)
+		// }
+
+		serverTID.Store(int64(tid))
+
+		if err := enc.Encode(&ipcActive{}); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+
+		fmt.Println("yoo")
+	}()
+
+	lastTID := pid
+	serverDetached := false
+	for {
+		fmt.Println("here1")
+
+		// Allow the child to continue until the next syscall entry or exit, at
+		// which point it will be stopped. Ignore ESRCH since the only way this
+		// can fail is if lastTID has been killed between the end of the wait
+		// and now.
+		if err := unix.PtraceSyscall(lastTID, 0); err != nil && !errors.Is(err, unix.ESRCH) {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+
+		fmt.Println("here2")
 
 		// Wait until we get a relevant state change.
 		var status unix.WaitStatus
 		for {
 			var err error
-			lastTid, err = unix.Wait4(-1, &status, unix.WUNTRACED, nil)
+			lastTID, err = unix.Wait4(-1, &status, 0, nil)
+			fmt.Println("here3")
 			if err != nil {
 				if err == unix.EINTR {
+					// Keep going until the wait succeeds.
 					continue
 				}
 
@@ -191,13 +326,30 @@ func init() {
 				os.Exit(1)
 			}
 
-			if isPtraceStop(status) || isEventClone(status) {
-				break
+			if status.Stopped() {
+				if isPtraceStop(status) || isEventClone(status) {
+					// Jump out of the inner loop to examine the syscall.
+					break
+				} else {
+					// Deliver the stop signal and allow the process to
+					// continue.
+					if err := unix.PtraceSyscall(lastTID, int(status.StopSignal())); err != nil {
+						if errors.Is(err, unix.ESRCH) {
+							// TODO: What do we do about this shit?
+							fmt.Println("lasdjkfslk", status.StopSignal())
+							continue
+						}
+
+						fmt.Fprintln(os.Stderr, err)
+						os.Exit(1)
+					}
+					continue
+				}
 			}
 
 			// If the whole child (not just one of its threads) exited, then we
 			// should exit too because there's nothing left to do.
-			if lastTid == pid {
+			if lastTID == pid {
 				switch {
 				case status.Exited():
 					os.Exit(status.ExitStatus())
@@ -215,21 +367,7 @@ func init() {
 			}
 		}
 
-		if isEventClone(status) {
-			// Find out the name of the new thread and resume it.
-			newTid, err := unix.PtraceGetEventMsg(lastTid)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
-			}
-
-			if err := unix.PtraceSyscall(int(newTid), 0); err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
-			}
-
-			continue
-		}
+		fmt.Println("here4")
 
 		// PTRACE_GET_SYSCALL_INFO actually returns a big struct, but op is the
 		// first field, and the data is truncated if there's not space for it,
@@ -237,9 +375,14 @@ func init() {
 		// definitions for the whole struct.
 		var op uint8
 		_, _, err := unix.Syscall6(unix.SYS_PTRACE,
-			unix.PTRACE_GET_SYSCALL_INFO, uintptr(lastTid), unsafe.Sizeof(op),
+			unix.PTRACE_GET_SYSCALL_INFO, uintptr(lastTID), unsafe.Sizeof(op),
 			uintptr(unsafe.Pointer(&op)), 0, 0)
 		if err != 0 {
+			if err == unix.ESRCH {
+				// Process could've been killed since the syscall-stop.
+				continue
+			}
+
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -248,17 +391,44 @@ func init() {
 			continue
 		}
 
+		fmt.Println("here5", lastTID)
+
+		serverTID := serverTID.Load()
+		if serverTID == 0 {
+			continue
+		} else if !serverDetached {
+			fmt.Println("detaching")
+			if err := syscall.PtraceDetach(int(serverTID)); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+		}
+
+		// Fetch regs.
 		var regs unix.PtraceRegs
-		if err := unix.PtraceGetRegs(lastTid, &regs); err != nil {
+		if err := unix.PtraceGetRegs(lastTID, &regs); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
 
-		// TODO: mutate regs over rpc
-		mregs := regs
+		// Mutate regs over rpc.
+		fmt.Println("encoding parent")
+		if err := enc.Encode(&regsAndTID{regs, lastTID}); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println("encoded parent")
+		fmt.Println("decoding parent")
+		var mregs unix.PtraceRegs
+		if err := dec.Decode(&mregs); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println("decoded parent")
 
+		// Set regs if mutated.
 		if regs != mregs {
-			if err := unix.PtraceSetRegs(lastTid, &mregs); err != nil {
+			if err := unix.PtraceSetRegs(lastTID, &mregs); err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
