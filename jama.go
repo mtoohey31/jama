@@ -6,18 +6,16 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"runtime"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
-// TODO: WTF is line 72 and onwards???
+// TODO: vet ESRCH handling
 
 // TODO: communication between parent and child and API for controlling what
 // fails/manipulating things arbitrarily.
@@ -113,20 +111,18 @@ func isPtraceStop(status unix.WaitStatus) bool {
 // isEventClone returns whether status indicates that the process/thread was
 // stopped due to a pthread clone event.
 func isEventClone(status unix.WaitStatus) bool {
-	return status.Stopped() &&
-		status>>8 == unix.WaitStatus(unix.SIGTRAP|unix.PTRACE_EVENT_CLONE<<8)
+	return status>>8 == unix.WaitStatus(unix.SIGTRAP|unix.PTRACE_EVENT_CLONE<<8)
 }
 
 func init() {
 	const (
-		CLIENTR_FD = iota + 3 // stdin, stdout, and stderr take up 1, 2, and 3.
+		CLIENTR_FD = iota + 3 // stdin, stdout, and stderr take up 0, 1, and 2.
 		CLIENTW_FD
 	)
 
 	// Protocol types.
 	type (
 		childMutatorTID int
-		ipcActive       struct{}
 		regsAndTID      struct {
 			Regs unix.PtraceRegs
 			TID  int
@@ -135,7 +131,6 @@ func init() {
 
 	mutatorID := childMutatorTID(0)
 	gob.Register(&mutatorID)
-	gob.Register(&ipcActive{})
 	gob.Register(&regsAndTID{})
 	gob.Register(&unix.PtraceRegs{})
 
@@ -145,44 +140,21 @@ func init() {
 			// Lock this thread so we can stop tracing only it in the parent.
 			runtime.LockOSThread()
 
-			dec := gob.NewDecoder(io.TeeReader(os.NewFile(CLIENTR_FD, "jama-read.pipe"), os.Stdout))
+			dec := gob.NewDecoder(os.NewFile(CLIENTR_FD, "jama-read.pipe"))
 			enc := gob.NewEncoder(os.NewFile(CLIENTW_FD, "jama-write.pipe"))
 
-			tid := unix.Gettid()
-			msg := childMutatorTID(tid)
-			fmt.Println("child is tid:", tid)
-			if err := enc.Encode(&msg); err != nil {
+			if err := unix.Kill(unix.Gettid(), unix.SIGTRAP); err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
-
-			fmt.Println("waiting for active")
-
-			var a ipcActive
-			if err := dec.Decode(&a); err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
-			}
-
-			// TODO: We've got a problem with proceeding. We can't exit init
-			// until we know that ipc and stuff is active, but that stuff can't
-			// be active until we know that this routine will be ready to accept
-			// stuff...
-
-			fmt.Println("marking intro done")
-			introDone <- struct{}{}
-			fmt.Println("done intro")
+			close(introDone)
 
 			for {
-				fmt.Println("decoding child")
-
 				var asdf regsAndTID
 				if err := dec.Decode(&asdf); err != nil {
 					fmt.Fprintln(os.Stderr, err)
 					os.Exit(1)
 				}
-
-				fmt.Println("decoded child")
 
 				mu.Lock()
 				if m != nil {
@@ -190,14 +162,10 @@ func init() {
 				}
 				mu.Unlock()
 
-				fmt.Println("encoding child")
-
 				if err := enc.Encode(&asdf.Regs); err != nil {
 					fmt.Fprintln(os.Stderr, err)
 					os.Exit(1)
 				}
-
-				fmt.Println("encoded child")
 			}
 		}()
 		<-introDone
@@ -270,35 +238,11 @@ func init() {
 		os.Exit(1)
 	}
 
-	var serverTID atomic.Int64
-	go func() {
-		var tid childMutatorTID
-		if err := dec.Decode(&tid); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-
-		// // Stop tracing the server thread of the child so it never gets stopped.
-		// if err := syscall.PtraceDetach(int(tid)); err != nil {
-		// 	fmt.Fprintln(os.Stderr, err)
-		// 	os.Exit(1)
-		// }
-
-		serverTID.Store(int64(tid))
-
-		if err := enc.Encode(&ipcActive{}); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-
-		fmt.Println("yoo")
-	}()
-
 	lastTID := pid
 	serverDetached := false
+	var serverTID int
+	serverDied := false
 	for {
-		fmt.Println("here1")
-
 		// Allow the child to continue until the next syscall entry or exit, at
 		// which point it will be stopped. Ignore ESRCH since the only way this
 		// can fail is if lastTID has been killed between the end of the wait
@@ -308,14 +252,12 @@ func init() {
 			os.Exit(1)
 		}
 
-		fmt.Println("here2")
-
 		// Wait until we get a relevant state change.
 		var status unix.WaitStatus
 		for {
 			var err error
+			// TODO: will -1 catch grandchildren too...?
 			lastTID, err = unix.Wait4(-1, &status, 0, nil)
-			fmt.Println("here3")
 			if err != nil {
 				if err == unix.EINTR {
 					// Keep going until the wait succeeds.
@@ -330,6 +272,19 @@ func init() {
 				if isPtraceStop(status) || isEventClone(status) {
 					// Jump out of the inner loop to examine the syscall.
 					break
+				} else if !serverDetached && status.StopSignal() == unix.SIGTRAP {
+					if err := unix.PtraceDetach(lastTID); err != nil {
+						fmt.Fprintln(os.Stderr, err)
+						os.Exit(1)
+					}
+
+					if err := unix.Kill(lastTID, unix.SIGCONT); err != nil {
+						fmt.Fprintln(os.Stderr, err)
+						os.Exit(1)
+					}
+
+					serverDetached = true
+					continue
 				} else {
 					// Deliver the stop signal and allow the process to
 					// continue.
@@ -365,9 +320,13 @@ func init() {
 					os.Exit(1)
 				}
 			}
-		}
 
-		fmt.Println("here4")
+			if lastTID == serverTID {
+				if status.Exited() || status.Signaled() {
+					serverDied = true
+				}
+			}
+		}
 
 		// PTRACE_GET_SYSCALL_INFO actually returns a big struct, but op is the
 		// first field, and the data is truncated if there's not space for it,
@@ -391,17 +350,8 @@ func init() {
 			continue
 		}
 
-		fmt.Println("here5", lastTID)
-
-		serverTID := serverTID.Load()
-		if serverTID == 0 {
+		if !serverDetached || serverDied {
 			continue
-		} else if !serverDetached {
-			fmt.Println("detaching")
-			if err := syscall.PtraceDetach(int(serverTID)); err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
-			}
 		}
 
 		// Fetch regs.
@@ -412,19 +362,15 @@ func init() {
 		}
 
 		// Mutate regs over rpc.
-		fmt.Println("encoding parent")
 		if err := enc.Encode(&regsAndTID{regs, lastTID}); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-		fmt.Println("encoded parent")
-		fmt.Println("decoding parent")
 		var mregs unix.PtraceRegs
 		if err := dec.Decode(&mregs); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-		fmt.Println("decoded parent")
 
 		// Set regs if mutated.
 		if regs != mregs {
