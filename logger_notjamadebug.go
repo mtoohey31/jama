@@ -2,6 +2,6 @@
 
 package jama
 
-import "golang.org/x/exp/slog"
+import "log/slog"
 
 var defaultLevel = slog.LevelWarn

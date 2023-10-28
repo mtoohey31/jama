@@ -6,13 +6,13 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"runtime"
 	"sync"
 	"syscall"
 	"unsafe"
 
-	"golang.org/x/exp/slog"
 	"golang.org/x/sys/unix"
 )
 
