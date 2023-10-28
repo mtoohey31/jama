@@ -6,7 +6,7 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
-	"log/slog"
+	"io"
 	"os"
 	"runtime"
 	"sync"
@@ -21,83 +21,10 @@ import (
 
 // TODO: Support for more platforms.
 
-func Register(m Mutator) { gob.Register(m) }
-
-// WithGlobal calls f with mf active for all goroutines. It cannot be used
-// concurrently with any other With* calls, including other calls of itself.
-func WithGlobal(m Mutator, f func()) {
-	clientMu.Lock()
-	require("(*gob.Encoder).Encode", clientEnc.Encode(
-		Ptr(any(&SetGlobal{Mutator: m})),
-	))
-	var ack Ack
-	require("(*gob.Decoder).Decode", clientDec.Decode(&ack))
-	clientMu.Unlock()
-
-	f()
-
-	clientMu.Lock()
-	require("(*gob.Encoder).Encode", clientEnc.Encode(Ptr(any(&RemoveGlobal{}))))
-	require("(*gob.Decoder).Decode", clientDec.Decode(&ack))
-	clientMu.Unlock()
-}
-
-// WithLocal calls f with m active for the current goroutine. If f creates new
-// goroutines, m will not apply to them. It cannot be used concurrently with any
-// other With* calls, and cannot be nested within calls to itself (i.e. f cannot
-// call WithLocal).
-func WithLocal(m Mutator, f func()) {
-	// Necessary so the goroutine that f is executed on is guaranteed to match
-	// the tid below.
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	tid := unix.Gettid()
-
-	clientMu.Lock()
-	require("(*gob.Encoder).Encode", clientEnc.Encode(
-		Ptr(any(&SetLocal{TID: tid, Mutator: m})),
-	))
-	var ack Ack
-	require("(*gob.Decoder).Decode", clientDec.Decode(&ack))
-	clientMu.Unlock()
-
-	f()
-
-	clientMu.Lock()
-	require("(*gob.Encoder).Encode", clientEnc.Encode(
-		Ptr(any(&RemoveLocal{TID: tid})),
-	))
-	require("(*gob.Decoder).Decode", clientDec.Decode(&ack))
-	clientMu.Unlock()
-}
-
-// isPtraceStop returns whether status indicates that the process/thread was
-// stopped by ptrace.
-func isPtraceStop(status unix.WaitStatus) bool {
-	// The |0x80 specifically indicates that this change was triggered by
-	// ptrace, as requested by out use of the PTRACE_O_TRACESYSGOOD option.
-	return status.StopSignal() == unix.SIGTRAP|0x80
-}
-
-// isEventClone returns whether status indicates that the process/thread was
-// stopped due to a pthread clone event.
-func isEventClone(status unix.WaitStatus) bool {
-	return status>>8 == unix.WaitStatus(unix.SIGTRAP|unix.PTRACE_EVENT_CLONE<<8)
-}
-
-func require(msg string, err error) {
-	if err != nil {
-		logger.Error(msg, err.Error())
-		os.Exit(1)
-	}
-}
-
-func requireErrno(msg string, errno syscall.Errno) {
-	if errno != 0 {
-		logger.Error(msg, errno.Error())
-		os.Exit(1)
-	}
+// Register must be called before a Mutator can be used with any With* calls.
+func Register[T Mutator]() {
+	var t T
+	gob.Register(t)
 }
 
 var (
@@ -110,6 +37,7 @@ var (
 	clientDec *gob.Decoder
 )
 
+// Init must be called before any With* calls, but after all Register calls.
 func Init() {
 	const (
 		jamaChildEnv = "JAMA_CHILD"
@@ -127,7 +55,7 @@ func Init() {
 	level.Set(defaultLevel)
 
 	if _, found := os.LookupEnv(jamaChildEnv); found {
-		logger.Debug("child started", slog.Int("pid", os.Getpid()))
+		logger.Debug("child started", "pid", os.Getpid())
 
 		clientEnc = gob.NewEncoder(os.NewFile(CLIENTW_FD, "jama-write.pipe"))
 		clientDec = gob.NewDecoder(os.NewFile(CLIENTR_FD, "jama-read.pipe"))
@@ -138,7 +66,7 @@ func Init() {
 	// If not set, we're in the parent, so start a child that will take the
 	// branch above and become ptrace'd by us.
 
-	logger.Debug("parent started", slog.Int("pid", os.Getpid()))
+	logger.Debug("parent started", "pid", os.Getpid())
 
 	// Create files and pipes to be used by child.
 	devNull, err := os.Open(os.DevNull)
@@ -183,7 +111,12 @@ func Init() {
 	go func() {
 		for {
 			var m any
-			require("(*gob.Decoder).Decode", dec.Decode(&m))
+			err := dec.Decode(&m)
+			if errors.Is(err, io.EOF) {
+				// Child exited.
+				break
+			}
+			require("(*gob.Decoder).Decode", err)
 			mu.Lock()
 			switch m := m.(type) {
 			case SetGlobal:
@@ -249,13 +182,18 @@ func Init() {
 			}
 			mu.Unlock()
 
-			require("(*gob.Encoder).Encode", enc.Encode(Ack{}))
+			err = enc.Encode(Ack{})
+			if errors.Is(err, io.ErrClosedPipe) {
+				// Child exited.
+				break
+			}
+			require("(*gob.Encoder).Encode", err)
 		}
 	}()
 
 	// Wait for the child to stop itself when it reaches the branch above.
 	var status unix.WaitStatus
-	_, err = unix.Wait4(pid, &status, 0, nil)
+	_, err = unix.Wait4(pid, &status, 0, nil) // TODO: handle other statuses.
 	require("unix.Wait4", err)
 
 	// We need PTRACE_O_TRACECLONE so we can monitor all goroutines and
@@ -267,12 +205,8 @@ func Init() {
 	lastTID := pid
 	for {
 		// Allow the child to continue until the next syscall entry or exit, at
-		// which point it will be stopped. Ignore ESRCH since the only way this
-		// can fail is if lastTID has been killed between the end of the wait
-		// and now.
-		if err := unix.PtraceSyscall(lastTID, 0); !errors.Is(err, unix.ESRCH) {
-			require("unix.PtraceSyscall", err)
-		}
+		// which point it will be stopped.
+		requireIgnoreESRCH("unix.PtraceSyscall", unix.PtraceSyscall(lastTID, 0))
 
 		// Wait until we get a relevant state change.
 		var status unix.WaitStatus
@@ -285,7 +219,7 @@ func Init() {
 				continue
 			}
 			require("unix.Wait4", err)
-			logger.Debug("unix.Wait4", slog.Int("tid", lastTID), slog.String("status", fmt.Sprintf("%#x", uint32(status))))
+			logger.Debug("unix.Wait4", "tid", lastTID, "status", fmt.Sprintf("%#x", uint32(status)))
 
 			if status.Stopped() {
 				if isPtraceStop(status) || isEventClone(status) {
@@ -294,12 +228,8 @@ func Init() {
 				} else {
 					// Deliver the stop signal and allow the process to
 					// continue.
-					err := unix.PtraceSyscall(lastTID, int(status.StopSignal()))
-					// Ignore ESRCH since lastTID may have been killed between
-					// us being told about the stop signal and now.
-					if !errors.Is(err, unix.ESRCH) {
-						require("unix.PtraceSyscall", err)
-					}
+					requireIgnoreESRCH("unix.PtraceSyscall",
+						unix.PtraceSyscall(lastTID, int(status.StopSignal())))
 					continue
 				}
 			}
@@ -332,12 +262,8 @@ func Init() {
 		_, _, err := unix.Syscall6(unix.SYS_PTRACE,
 			unix.PTRACE_GET_SYSCALL_INFO, uintptr(lastTID), unsafe.Sizeof(op),
 			uintptr(unsafe.Pointer(&op)), 0, 0)
-		if err == unix.ESRCH {
-			// Process could've been killed since the syscall-stop.
-			continue
-		}
-		requireErrno("unix.Syscall6, unix.SYS_PTRACE", err)
-		logger.Debug("unix.Syscall6, unix.SYS_PTRACE", slog.Any("op", op))
+		requireErrnoIgnoreESRCH("unix.Syscall6, unix.SYS_PTRACE", err)
+		logger.Debug("unix.Syscall6, unix.SYS_PTRACE", "op", op)
 
 		if op != unix.PTRACE_SYSCALL_INFO_EXIT {
 			// We only act on syscall exits.
@@ -346,8 +272,9 @@ func Init() {
 
 		// Fetch regs.
 		var regs unix.PtraceRegs
-		require("unix.PtraceGetRegs", unix.PtraceGetRegs(lastTID, &regs))
-		logger.Debug("unix.PtraceGetRegs", slog.Any("regs", regs))
+		requireIgnoreESRCH("unix.PtraceGetRegs",
+			unix.PtraceGetRegs(lastTID, &regs))
+		logger.Debug("unix.PtraceGetRegs", "regs", regs)
 
 		// Mutate regs.
 		mregs := regs
@@ -355,11 +282,62 @@ func Init() {
 		if mp != nil {
 			mp.mutatorForTID(lastTID).Mutate(&mregs)
 		}
+		logger.Debug("(Mutator).Mutate", "mregs", regs)
 		mu.Unlock()
 
 		// Set regs if mutated.
 		if regs != mregs {
-			require("unix.PtraceSetRegs", unix.PtraceSetRegs(lastTID, &mregs))
+			requireIgnoreESRCH("unix.PtraceSetRegs",
+				unix.PtraceSetRegs(lastTID, &mregs))
 		}
 	}
+}
+
+// WithGlobal calls f with mf active for all goroutines. It cannot be used
+// concurrently with any other With* calls, including other calls of itself.
+func WithGlobal(m Mutator, f func()) {
+	clientMu.Lock()
+	require("(*gob.Encoder).Encode", clientEnc.Encode(
+		Ptr(any(&SetGlobal{Mutator: m})),
+	))
+	var ack Ack
+	require("(*gob.Decoder).Decode", clientDec.Decode(&ack))
+	clientMu.Unlock()
+
+	f()
+
+	clientMu.Lock()
+	require("(*gob.Encoder).Encode", clientEnc.Encode(Ptr(any(&RemoveGlobal{}))))
+	require("(*gob.Decoder).Decode", clientDec.Decode(&ack))
+	clientMu.Unlock()
+}
+
+// WithLocal calls f with m active for the current goroutine. If f creates new
+// goroutines, m will not apply to them. It cannot be used concurrently with any
+// other With* calls, and cannot be nested within calls to itself (i.e. f cannot
+// call WithLocal).
+func WithLocal(m Mutator, f func()) {
+	// Necessary so the goroutine that f is executed on is guaranteed to match
+	// the tid below.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	tid := unix.Gettid()
+
+	clientMu.Lock()
+	require("(*gob.Encoder).Encode", clientEnc.Encode(
+		Ptr(any(&SetLocal{TID: tid, Mutator: m})),
+	))
+	var ack Ack
+	require("(*gob.Decoder).Decode", clientDec.Decode(&ack))
+	clientMu.Unlock()
+
+	f()
+
+	clientMu.Lock()
+	require("(*gob.Encoder).Encode", clientEnc.Encode(
+		Ptr(any(&RemoveLocal{TID: tid})),
+	))
+	require("(*gob.Decoder).Decode", clientDec.Decode(&ack))
+	clientMu.Unlock()
 }

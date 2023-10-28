@@ -1,14 +1,14 @@
-package jamatest
+package jama
 
 import (
 	"errors"
 	"math"
 	"os"
+	"strconv"
 	"sync"
 	"testing"
 
 	"golang.org/x/sys/unix"
-	"mtoohey.com/jama"
 )
 
 // StatFailingMutator is a jama.Mutator that causes os.Stat to fail.
@@ -22,13 +22,13 @@ func (StatFailingMutator) Mutate(regs *unix.PtraceRegs) {
 }
 
 func TestMain(m *testing.M) {
-	jama.Register(StatFailingMutator{})
-	jama.Init()
+	Register[StatFailingMutator]()
+	Init()
 	os.Exit(m.Run())
 }
 
-func TestFoo(t *testing.T) {
-	jama.WithGlobal(StatFailingMutator{}, func() {
+func TestGlobal(t *testing.T) {
+	WithGlobal(StatFailingMutator{}, func() {
 		var wg sync.WaitGroup
 		wg.Add(1)
 		go func() {
@@ -42,11 +42,16 @@ func TestFoo(t *testing.T) {
 	})
 }
 
-func TestBar(t *testing.T) {
-	jama.WithLocal(StatFailingMutator{}, func() {
-		_, err := os.Stat("file")
-		if !errors.Is(err, unix.ENOENT) {
-			t.Fatal("expected ENOENT, got:", err)
-		}
-	})
+func TestLocal(t *testing.T) {
+	for i := 0; i < 5; i++ {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			t.Parallel()
+			WithLocal(StatFailingMutator{}, func() {
+				_, err := os.Stat("file")
+				if !errors.Is(err, unix.ENOENT) {
+					t.Fatal("expected ENOENT, got:", err)
+				}
+			})
+		})
+	}
 }
