@@ -311,8 +311,6 @@ func init() {
 
 			if lastTID == serverTID {
 				if status.Exited() || status.Signaled() {
-					// TODO: we should probably just kill the child if this
-					// happens, right?
 					serverDied = true
 				}
 			}
@@ -338,8 +336,18 @@ func init() {
 			continue
 		}
 
-		if !serverDetached || serverDied {
+		if !serverDetached {
 			continue
+		}
+
+		if serverDied {
+			// Should never happen unless the server exited unexpectedly. The
+			// server should only exit when the program is exiting, after which
+			// point only os.Exit should be used, which doesn't return and
+			// therefore never causes PTRACE_SYSCALL_INFO_EXIT.
+			logger.Error("reached syscall exit after server died")
+			require("unix.Kill", unix.Kill(pid, unix.SIGKILL))
+			os.Exit(1)
 		}
 
 		// Fetch regs.
