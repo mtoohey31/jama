@@ -4,36 +4,48 @@ package jama
 
 import "golang.org/x/sys/unix"
 
-// MutatorFunc is a function that mutates regs.
-type MutatorFunc func(regs *unix.PtraceRegs)
-
-// mutator provides a method for mutating regs.
-type mutator interface {
-	// mutate regs, which belong to the given tid.
-	mutate(tid int, regs *unix.PtraceRegs)
+// Mutator provides a method for mutating registers.
+type Mutator interface {
+	// Mutate modifies regs.
+	Mutate(regs *unix.PtraceRegs)
 }
 
-// globalMutator applies the same thread mutation to all TIDs.
-type globalMutator MutatorFunc
+// noopMutator is a Mutator that makes no changes.
+type noopMutator struct{}
 
-// mutate implements mutator.
-func (m globalMutator) mutate(tid int, regs *unix.PtraceRegs) { m(regs) }
+// Mutate implements Mutator.
+func (noopMutator) Mutate(regs *unix.PtraceRegs) {}
 
-// perTIDMutator mutates registers on a per-TID basis.
-type perTIDMutator map[int]MutatorFunc
+// mutatorProvider provides a method for fetching the Mutator for a given tid.
+type mutatorProvider interface {
+	// mutatorForTID returns the mutator for the given tid.
+	mutatorForTID(tid int) Mutator
+}
 
-// mutate implements mutator.
-func (m perTIDMutator) mutate(tid int, regs *unix.PtraceRegs) {
-	mf, ok := m[tid]
+// globalMutatorProvider provides the same Mutator for all TIDs.
+type globalMutatorProvider struct{ inner Mutator }
+
+// mutatorForTID implements mutatorProvider.
+func (mp globalMutatorProvider) mutatorForTID(tid int) Mutator {
+	return mp.inner
+}
+
+// localMutatorProvider provides a different Mutator for each TID.
+type localMutatorProvider map[int]Mutator
+
+// mutatorForTID implements mutatorProvider.
+func (mp localMutatorProvider) mutatorForTID(tid int) Mutator {
+	m, ok := mp[tid]
 	if !ok {
-		return
+		return noopMutator{}
 	}
 
-	mf(regs)
+	return m
 }
 
-// Ensure mutators implement interface.
+// Ensure interfaces are satisfied.
 var (
-	_ mutator = globalMutator(nil)
-	_ mutator = perTIDMutator{}
+	_ Mutator         = noopMutator{}
+	_ mutatorProvider = globalMutatorProvider{}
+	_ mutatorProvider = localMutatorProvider{}
 )

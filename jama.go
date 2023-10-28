@@ -16,54 +16,37 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// TODO: Handle panics in child, they seem to kill the server which deadlocks
-// things...
-
 // TODO: Can we skip actually doing the syscall and allow the users of mocking
 // the whole syscall?
 
 // TODO: Support for more platforms.
 
-// jamaChildEnv is the name of the environment variable used to signal that
-// we're running in the child process which should be traced.
-const jamaChildEnv = "JAMA_CHILD"
-
-var (
-	// m is the global mutator. Only used in the client process.
-	m mutator = nil
-	// mu protects m.
-	mu sync.Mutex
-)
-
-// TODO: Do I panic, or just lock?
+func Register(m Mutator) { gob.Register(m) }
 
 // WithGlobal calls f with mf active for all goroutines. It cannot be used
 // concurrently with any other With* calls, including other calls of itself.
-func WithGlobal(mf MutatorFunc, f func()) {
-	logger.Debug("installing global")
-	mu.Lock()
-	if m != nil {
-		mu.Unlock()
-		panic("jama: WithGlobal: called while other mutation was already active")
-	}
-	m = globalMutator(mf)
-	mu.Unlock()
-	logger.Debug("global installed")
+func WithGlobal(m Mutator, f func()) {
+	clientMu.Lock()
+	require("(*gob.Encoder).Encode", clientEnc.Encode(
+		Ptr(any(&SetGlobal{Mutator: m})),
+	))
+	var ack Ack
+	require("(*gob.Decoder).Decode", clientDec.Decode(&ack))
+	clientMu.Unlock()
 
 	f()
 
-	logger.Debug("uninstalling global")
-	mu.Lock()
-	m = nil
-	mu.Unlock()
-	logger.Debug("global uninstalled")
+	clientMu.Lock()
+	require("(*gob.Encoder).Encode", clientEnc.Encode(Ptr(any(&RemoveGlobal{}))))
+	require("(*gob.Decoder).Decode", clientDec.Decode(&ack))
+	clientMu.Unlock()
 }
 
-// WithLocal calls f with mf active for the current goroutine. If f creates new
-// goroutines, mf will not apply to them. It cannot be used concurrently with
-// any other With* calls, and cannot be nested within calls to itself (i.e. f
-// cannot call WithLocal).
-func WithLocal(mf MutatorFunc, f func()) {
+// WithLocal calls f with m active for the current goroutine. If f creates new
+// goroutines, m will not apply to them. It cannot be used concurrently with any
+// other With* calls, and cannot be nested within calls to itself (i.e. f cannot
+// call WithLocal).
+func WithLocal(m Mutator, f func()) {
 	// Necessary so the goroutine that f is executed on is guaranteed to match
 	// the tid below.
 	runtime.LockOSThread()
@@ -71,40 +54,22 @@ func WithLocal(mf MutatorFunc, f func()) {
 
 	tid := unix.Gettid()
 
-	logger.Debug("installing local", slog.Int("tid", tid))
-	mu.Lock()
-
-	var perTID perTIDMutator
-	var ok bool
-	if m == nil {
-		// If there was no active mutator, create a new per-TID mutator.
-		perTID = perTIDMutator{}
-		m = perTID
-	} else if perTID, ok = m.(perTIDMutator); !ok {
-		// If there was an active mutator but it wasn't per-TID, panic.
-		mu.Unlock()
-		panic("jama: WithLocal: called while global mutation was already active")
-	}
-
-	if _, ok := perTID[tid]; ok {
-		mu.Unlock()
-		panic("jama: WithLocal: called while mutation for this goroutine was already active")
-	}
-
-	perTID[tid] = mf
-	mu.Unlock()
-	logger.Debug("local installed", slog.Int("tid", tid))
+	clientMu.Lock()
+	require("(*gob.Encoder).Encode", clientEnc.Encode(
+		Ptr(any(&SetLocal{TID: tid, Mutator: m})),
+	))
+	var ack Ack
+	require("(*gob.Decoder).Decode", clientDec.Decode(&ack))
+	clientMu.Unlock()
 
 	f()
 
-	logger.Debug("uninstalling local", slog.Int("tid", tid))
-	mu.Lock()
-	delete(perTID, tid)
-	if len(perTID) == 0 {
-		m = nil
-	}
-	mu.Unlock()
-	logger.Debug("local uninstalled", slog.Int("tid", tid))
+	clientMu.Lock()
+	require("(*gob.Encoder).Encode", clientEnc.Encode(
+		Ptr(any(&RemoveLocal{TID: tid})),
+	))
+	require("(*gob.Decoder).Decode", clientDec.Decode(&ack))
+	clientMu.Unlock()
 }
 
 // isPtraceStop returns whether status indicates that the process/thread was
@@ -135,81 +100,58 @@ func requireErrno(msg string, errno syscall.Errno) {
 	}
 }
 
-func init() {
-	level.Set(defaultLevel)
+var (
+	// clientMu protects clientDec and clientEnc, since they must be locked for each
+	// read/write operation pair to ensure that the received read actually
+	// corresponds to the write.
+	clientMu sync.Mutex
 
+	clientEnc *gob.Encoder
+	clientDec *gob.Decoder
+)
+
+func Init() {
 	const (
-		CLIENTR_FD = iota + 3 // stdin, stdout, and stderr take up 0, 1, and 2.
-		CLIENTW_FD
+		jamaChildEnv = "JAMA_CHILD"
+
+		CLIENTW_FD = iota + 3 // stdin, stdout, and stderr take up 0, 1, and 2.
+		CLIENTR_FD
 	)
 
-	// Protocol types.
-	type (
-		childMutatorTID int
-		regsAndTID      struct {
-			Regs unix.PtraceRegs
-			TID  int
-		}
-	)
+	gob.Register(SetGlobal{})
+	gob.Register(RemoveGlobal{})
+	gob.Register(SetLocal{})
+	gob.Register(RemoveLocal{})
+	gob.Register(Ack{})
 
-	mutatorID := childMutatorTID(0)
-	gob.Register(&mutatorID)
-	gob.Register(&regsAndTID{})
-	gob.Register(&unix.PtraceRegs{})
+	level.Set(defaultLevel)
 
 	if _, found := os.LookupEnv(jamaChildEnv); found {
 		logger.Debug("child started", slog.Int("pid", os.Getpid()))
 
-		introDone := make(chan struct{})
-		go func() {
-			// Lock this thread so we can stop tracing only it in the parent.
-			runtime.LockOSThread()
+		clientEnc = gob.NewEncoder(os.NewFile(CLIENTW_FD, "jama-write.pipe"))
+		clientDec = gob.NewDecoder(os.NewFile(CLIENTR_FD, "jama-read.pipe"))
 
-			logger.Debug("server started", slog.Int("tid", unix.Gettid()))
-
-			dec := gob.NewDecoder(os.NewFile(CLIENTR_FD, "jama-read.pipe"))
-			enc := gob.NewEncoder(os.NewFile(CLIENTW_FD, "jama-write.pipe"))
-
-			require("unix.Kill", unix.Kill(unix.Gettid(), unix.SIGTRAP))
-			close(introDone)
-
-			logger.Debug("server entering loop")
-
-			for {
-				var asdf regsAndTID
-				require("(*gob.Decoder).Decode", dec.Decode(&asdf))
-
-				mu.Lock()
-				if m != nil {
-					m.mutate(asdf.TID, &asdf.Regs)
-				}
-				mu.Unlock()
-
-				require("(*gob.Encoder).Encode", enc.Encode(&asdf.Regs))
-			}
-		}()
-		<-introDone
-		logger.Debug("child init finished")
 		return
 	}
 
-	logger.Debug("parent started", slog.Int("pid", os.Getpid()))
-
 	// If not set, we're in the parent, so start a child that will take the
 	// branch above and become ptrace'd by us.
+
+	logger.Debug("parent started", slog.Int("pid", os.Getpid()))
 
 	// Create files and pipes to be used by child.
 	devNull, err := os.Open(os.DevNull)
 	require("os.Open", err)
 
-	clientR, parentW, err := os.Pipe()
-	require("os.Pipe", err)
-
 	parentR, clientW, err := os.Pipe()
 	require("os.Pipe", err)
 
-	enc := gob.NewEncoder(parentW)
+	clientR, parentW, err := os.Pipe()
+	require("os.Pipe", err)
+
 	dec := gob.NewDecoder(parentR)
+	enc := gob.NewEncoder(parentW)
 
 	// Necessary because only the thread that spawns the process below which
 	// will call PTRACE_TRACEME on startup will have permission to contorol it,
@@ -217,16 +159,99 @@ func init() {
 	// on which PTRACE_* operations would fail and cause everything to break.
 	runtime.LockOSThread()
 
+	// Start the child.
 	proc, err := os.StartProcess(os.Args[0], os.Args, &os.ProcAttr{
 		Files: []*os.File{
 			devNull, os.Stdout, os.Stderr,
-			CLIENTR_FD: clientR, CLIENTW_FD: clientW,
+			CLIENTW_FD: clientW, CLIENTR_FD: clientR,
 		},
 		Env: append(os.Environ(), jamaChildEnv+"=1"),
 		Sys: &syscall.SysProcAttr{Ptrace: true},
 	})
 	require("os.StartProcess", err)
 	pid := proc.Pid
+
+	// Close pipes cause the parent shouldn't be writing to them anymore.
+	require("(*os.File).Close", clientW.Close())
+	require("(*os.File).Close", clientR.Close())
+
+	// Start communication routine.
+	var (
+		mu sync.Mutex
+		mp mutatorProvider = nil
+	)
+	go func() {
+		for {
+			var m any
+			require("(*gob.Decoder).Decode", dec.Decode(&m))
+			mu.Lock()
+			switch m := m.(type) {
+			case SetGlobal:
+				if mp == nil {
+					mp = globalMutatorProvider{inner: m}
+				} else {
+					require("unix.Kill", unix.Kill(pid, unix.SIGKILL))
+					panic("jama: WithGlobal: called while other mutation was already active")
+				}
+
+			case RemoveGlobal:
+				if mp != nil {
+					if _, ok := mp.(globalMutatorProvider); ok {
+						mp = nil
+					} else {
+						require("unix.Kill", unix.Kill(pid, unix.SIGKILL))
+						panic("jama: WithGlobal: exited while non-global mutation was active")
+					}
+				} else {
+					require("unix.Kill", unix.Kill(pid, unix.SIGKILL))
+					panic("jama: WithGlobal: exited while no mutation was active")
+				}
+
+			case SetLocal:
+				if mp == nil {
+					mp = localMutatorProvider{m.TID: m.Mutator}
+				} else if mp, ok := mp.(localMutatorProvider); ok {
+					if _, ok := mp[m.TID]; !ok {
+						mp[m.TID] = m.Mutator
+					} else {
+						require("unix.Kill", unix.Kill(pid, unix.SIGKILL))
+						panic("jama: WithLocal: called while mutation for this goroutine was already active")
+					}
+				} else {
+					require("unix.Kill", unix.Kill(pid, unix.SIGKILL))
+					panic("jama: WithLocal: called while global mutation was already active")
+				}
+
+			case RemoveLocal:
+				if mp != nil {
+					if lmp, ok := mp.(localMutatorProvider); ok {
+						if _, ok := lmp[m.TID]; ok {
+							delete(lmp, m.TID)
+							if len(lmp) == 0 {
+								mp = nil
+							}
+						} else {
+							require("unix.Kill", unix.Kill(pid, unix.SIGKILL))
+							panic("jama: WithLocal: exited while no mutation for this goroutine was active")
+						}
+					} else {
+						require("unix.Kill", unix.Kill(pid, unix.SIGKILL))
+						panic("jama: WithLocal: exited while non-local mutation was active")
+					}
+				} else {
+					require("unix.Kill", unix.Kill(pid, unix.SIGKILL))
+					panic("jama: WithLocal: exited while no mutation was active")
+				}
+
+			default:
+				mu.Unlock()
+				panic("unexpected message")
+			}
+			mu.Unlock()
+
+			require("(*gob.Encoder).Encode", enc.Encode(Ack{}))
+		}
+	}()
 
 	// Wait for the child to stop itself when it reaches the branch above.
 	var status unix.WaitStatus
@@ -240,9 +265,6 @@ func init() {
 	require("unix.PtraceSetOptions", unix.PtraceSetOptions(pid, options))
 
 	lastTID := pid
-	serverDetached := false
-	var serverTID int
-	serverDied := false
 	for {
 		// Allow the child to continue until the next syscall entry or exit, at
 		// which point it will be stopped. Ignore ESRCH since the only way this
@@ -269,14 +291,6 @@ func init() {
 				if isPtraceStop(status) || isEventClone(status) {
 					// Jump out of the inner loop to examine the syscall.
 					break
-				} else if !serverDetached && status.StopSignal() == unix.SIGTRAP {
-					require("unix.PtraceDetach", unix.PtraceDetach(lastTID))
-					logger.Debug("server detached", slog.Int("tid", lastTID))
-
-					require("unix.Kill", unix.Kill(lastTID, unix.SIGCONT))
-
-					serverDetached = true
-					continue
 				} else {
 					// Deliver the stop signal and allow the process to
 					// continue.
@@ -308,12 +322,6 @@ func init() {
 					os.Exit(1)
 				}
 			}
-
-			if lastTID == serverTID {
-				if status.Exited() || status.Signaled() {
-					serverDied = true
-				}
-			}
 		}
 
 		// PTRACE_GET_SYSCALL_INFO actually returns a big struct, but op is the
@@ -336,30 +344,18 @@ func init() {
 			continue
 		}
 
-		if !serverDetached {
-			continue
-		}
-
-		if serverDied {
-			// Should never happen unless the server exited unexpectedly. The
-			// server should only exit when the program is exiting, after which
-			// point only os.Exit should be used, which doesn't return and
-			// therefore never causes PTRACE_SYSCALL_INFO_EXIT.
-			logger.Error("reached syscall exit after server died")
-			require("unix.Kill", unix.Kill(pid, unix.SIGKILL))
-			os.Exit(1)
-		}
-
 		// Fetch regs.
 		var regs unix.PtraceRegs
 		require("unix.PtraceGetRegs", unix.PtraceGetRegs(lastTID, &regs))
 		logger.Debug("unix.PtraceGetRegs", slog.Any("regs", regs))
 
-		// Mutate regs over rpc.
-		require("(*gob.Encoder).Encode", enc.Encode(&regsAndTID{regs, lastTID}))
-		var mregs unix.PtraceRegs
-		require("(*gob.Decoder).Decode", dec.Decode(&mregs))
-		logger.Debug("got mutated regs from rpc", slog.Any("mregs", mregs))
+		// Mutate regs.
+		mregs := regs
+		mu.Lock()
+		if mp != nil {
+			mp.mutatorForTID(lastTID).Mutate(&mregs)
+		}
+		mu.Unlock()
 
 		// Set regs if mutated.
 		if regs != mregs {
