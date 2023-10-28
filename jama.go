@@ -16,18 +16,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// TODO: handle panics in child, they seem to kill the server which deadlocks
+// TODO: Handle panics in child, they seem to kill the server which deadlocks
 // things...
 
-// TODO: vet ESRCH handling
-
-// TODO: communication between parent and child and API for controlling what
-// fails/manipulating things arbitrarily.
-
-// TODO: can we skip actually doing the syscall and allow the users of mocking
+// TODO: Can we skip actually doing the syscall and allow the users of mocking
 // the whole syscall?
 
-// TODO: support for more platforms
+// TODO: Support for more platforms.
 
 // jamaChildEnv is the name of the environment variable used to signal that
 // we're running in the child process which should be traced.
@@ -286,12 +281,11 @@ func init() {
 					// Deliver the stop signal and allow the process to
 					// continue.
 					err := unix.PtraceSyscall(lastTID, int(status.StopSignal()))
-					if errors.Is(err, unix.ESRCH) {
-						// TODO: What do we do about this shit?
-						fmt.Println("lasdjkfslk", status.StopSignal())
-						continue
+					// Ignore ESRCH since lastTID may have been killed between
+					// us being told about the stop signal and now.
+					if !errors.Is(err, unix.ESRCH) {
+						require("unix.PtraceSyscall", err)
 					}
-					require("unix.PtraceSyscall", err)
 					continue
 				}
 			}
