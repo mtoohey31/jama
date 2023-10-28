@@ -1,9 +1,0 @@
-[[language]]
-name = "c"
-auto-format = true
-formatter = { command = "clang-format", args = [] }
-
-[[language]]
-name = "cpp"
-auto-format = true
-formatter = { command = "clang-format", args = [] }
