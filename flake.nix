@@ -9,11 +9,11 @@
   outputs = { self, nixpkgs, utils }: utils.lib.eachDefaultSystem (system:
     let
       pkgs = import nixpkgs { inherit system; };
-      inherit (pkgs) clang-tools gdb go gopls man-pages man-pages-posix mkShell;
+      inherit (pkgs) go gopls man-pages man-pages-posix mkShell;
     in
     {
       devShells.default = mkShell {
-        packages = [ clang-tools gdb go gopls man-pages man-pages-posix ];
+        packages = [ go gopls man-pages man-pages-posix ];
       };
     });
 }
